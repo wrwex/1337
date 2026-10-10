@@ -1,0 +1,293 @@
+# DE2026_MSK, Задание 1 — только недостающие команды
+
+Эта версия опирается на сохранённый аудит **28.09.2026** лаборатории `/opt/unetlab/labs/DE2026_MSK/DE2026_mod1.unl`. 10.10.2026 повторно подтвердили, что все девять узлов остановлены, но не смогли перечитать их внутренние конфигурации. Поэтому статус «уже есть» относится к 28.09.2026. Команды ниже **не выполнялись**. Перед применением сравните с текущей конфигурацией; если параметр уже исправлен, пропустите его. Особенно это относится к именам L3-интерфейсов EcoRouter, которых в сохранённом аудите нет дословно.
+
+| Узел | Что уже было настроено | Что добавить/исправить |
+|---|---|---|
+| ISP | `ens3` DHCP + default route, `ip_forward=1`; `ens4` DHCP без адреса | `ens4=172.16.1.1/28`, `ens5=172.16.2.1/28`, PAT/forwarding |
+| HQ-RTR | `isp=172.16.1.2/28`; VLAN 100/200/999 со шлюзами; DHCP-пул VLAN 200 | default route, GRE, OSPF/MD5, NAT, пользователь, коррекция DHCP-маски |
+| HQ-SW | trunk/access VLAN и IP управления `10.10.30.2/29` | только проверка, при необходимости hostname |
+| HQ-SRV | пустой IPv4 `ens3`, частично созданная зона BIND | IP/route, SSH, запуск/подключение DNS, исправление двух A-записей |
+| HQ-CLI | DHCP-профиль на `ens3` | hostname, DHCP-проверка после запуска соседей |
+| BR-RTR | `isp=172.16.2.2/28`, `fw=10.20.10.1/30` | default route, GRE, OSPF/MD5, NAT, пользователь |
+| BR-FW | три адресованных порта | default route, OSPF/политики в веб-интерфейсе |
+| BR-SRV | пустой IPv4 `ens3` | IP/route, SSH, DNS-клиент |
+| BR-CLI | DHCP-профиль без полученного адреса | статический адрес, если DHCP на Ideco не включён |
+
+Пароль нового `sshuser` и `net_admin` по заданию — `P@ssw0rd`. Часовой пояс `Europe/Moscow` применяйте, только если место экзамена — Москва.
+
+## ISP — добавить адреса и PAT, оставить `ens3` как есть
+
+```sh
+# Сначала посмотреть действующий профиль и правила:
+cat /etc/net/ifaces/ens4/options
+ip -4 addr show ens3
+iptables-save
+hostnamectl set-hostname isp.au-team.irpo
+
+# На ens4 заменить именно BOOTPROTO=dhcp на static; прочие параметры не стирать:
+sed -i 's/^BOOTPROTO=.*/BOOTPROTO=static/' /etc/net/ifaces/ens4/options
+printf '172.16.1.1/28\n' > /etc/net/ifaces/ens4/ipv4address
+
+# Для ещё не настроенного ens5:
+mkdir -p /etc/net/ifaces/ens5
+printf 'TYPE=eth\nBOOTPROTO=static\nONBOOT=yes\n' > /etc/net/ifaces/ens5/options
+printf '172.16.2.1/28\n' > /etc/net/ifaces/ens5/ipv4address
+systemctl restart network
+
+# ip_forward уже был равен 1: проверить, не дублировать настройку без необходимости.
+sysctl net.ipv4.ip_forward
+ip -4 route
+```
+
+PAT на ISP для уже транслированных WAN-адресов маршрутизаторов. `-C` защищает от повторного добавления. Если policy FORWARD уже разрешает эти направления, блок FORWARD не нужен; если policy DROP — проверьте текущий порядок правил и добавьте разрешения перед запретом.
+
+```sh
+iptables -t nat -C POSTROUTING -s 172.16.1.0/28 -o ens3 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.16.1.0/28 -o ens3 -j MASQUERADE
+iptables -t nat -C POSTROUTING -s 172.16.2.0/28 -o ens3 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.16.2.0/28 -o ens3 -j MASQUERADE
+iptables -L FORWARD -n -v --line-numbers
+iptables -t nat -L POSTROUTING -n -v
+```
+
+При необходимости разрешить `ens4↔ens5` протокол GRE (`-p 47`), а `ens4/ens5→ens3` и обратный `ESTABLISHED,RELATED`. Не сохранять `iptables-save` в случайный файл: проверьте, какая служба firewall загружает правила после перезагрузки, и сохраните их её штатным способом.
+
+## HQ-RTR — дополнить существующие WAN/VLAN/DHCP
+
+Сначала `show running-config` и `show ip interface brief`. **Не вводите повторно адреса `isp`, VLAN 100/200/999 и не создавайте заново DHCP-пул.** Вставьте блок только если отсутствуют default/GRE/OSPF/NAT. В строках `<IF100>`, `<IF200>`, `<IF999>` подставьте **точные имена L3-интерфейсов из текущего вывода**, например они могут отличаться от имён VLAN/service-instance.
+
+```text
+enable
+configure
+hostname hq-rtr
+username net_admin
+ password P@ssw0rd
+ role admin
+ exit
+ip route 0.0.0.0/0 172.16.1.1
+interface tunnel.0
+ ip address 10.10.10.1/30
+ ip mtu 1400
+ ip tunnel 172.16.1.2 172.16.2.2 mode gre
+ ip ospf network point-to-point
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 P@ssw0rd
+ exit
+router ospf 1
+ network 10.10.10.0 0.0.0.3 area 0
+ network 10.10.100.0 0.0.0.31 area 0
+ network 10.10.200.0 0.0.0.15 area 0
+ network 10.10.30.0 0.0.0.7 area 0
+ passive-interface <IF100>
+ passive-interface <IF200>
+ passive-interface <IF999>
+ exit
+interface isp
+ ip nat outside
+ exit
+interface <IF100>
+ ip nat inside
+ exit
+interface <IF200>
+ ip nat inside
+ exit
+interface <IF999>
+ ip nat inside
+ exit
+ip nat pool HQ-LOCAL 10.10.100.1-10.10.100.30,10.10.200.1-10.10.200.14,10.10.30.1-10.10.30.6
+ip nat source dynamic inside pool HQ-LOCAL overload interface isp
+end
+write memory
+```
+
+**DHCP:** пул `10.10.200.2–10.10.200.14`, gateway `.1`, DNS `10.10.100.2`, суффикс `au-team.irpo` уже были. В прошлом конфиге глобальная маска `/24` соседствовала с маской пула `/28`. Проверьте раздел `dhcp-server` и фактическую аренду HQ-CLI; исправьте маску **только того раздела, который реально выдаёт её клиенту**, на `255.255.255.240`. Для записи `hq-cli.au-team.irpo A 10.10.200.2` полезна привязка к реальному MAC HQ-CLI (узнать `ip link show ens3` на клиенте):
+
+```text
+enable
+configure
+dhcp-server 1
+ static ip 10.10.200.2
+  chaddr XXXX.XXXX.XXXX
+  mask 255.255.255.240
+  gateway 10.10.200.1
+  dns 10.10.100.2
+  domain-name au-team.irpo
+  exit
+ exit
+end
+write memory
+```
+
+Замените `XXXX.XXXX.XXXX` на реальный MAC; у этой записи не должно быть конфликта с действующей арендой другого клиента. Если версия CLI не принимает `domain-name` внутри `static ip`, оставьте уже работающий суффикс из существующего пула. Для FQDN и времени проверьте поддержку `ip domain-name au-team.irpo` и `ntp timezone utc+3` через `?`, затем применяйте. **Никаких изменений `ge1`/service-instance/VLAN tagging не требуется.**
+
+## HQ-SW — преднастрой уже соответствует VLAN-заданию
+
+```sh
+ovs-vsctl show
+ip -4 addr show MGMT
+ip -4 route
+hostnamectl set-hostname hq-sw.au-team.irpo
+```
+
+Команды `ovs-vsctl add-port` или изменения тегов не нужны: в преднастрое `ens3` trunk 100/200/999, `ens4` access 100, `ens5` access 200, MGMT 999. Если текущий вывод такой же, ограничьтесь проверкой. Часовой пояс для виртуального коммутатора задание исключает.
+
+## HQ-SRV — заполнить пустой адрес, доработать имеющуюся зону
+
+`ens3` имел статический профиль, но не имел IPv4 и маршрута. `ens4=169.254.2.101/30` не трогать:
+
+```sh
+cat /etc/net/ifaces/ens3/options
+printf '10.10.100.2/27\n' > /etc/net/ifaces/ens3/ipv4address
+printf 'default via 10.10.100.1\n' > /etc/net/ifaces/ens3/ipv4route
+systemctl restart network
+hostnamectl set-hostname hq-srv.au-team.irpo
+timedatectl set-timezone Europe/Moscow
+```
+
+Учётная запись и SSH (сначала проверить, что `sshuser` не существует с другим UID):
+
+```sh
+id sshuser || useradd -u 2027 -m -s /bin/bash sshuser
+passwd sshuser
+printf 'sshuser ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/90-sshuser
+chmod 0440 /etc/sudoers.d/90-sshuser
+visudo -c
+printf 'Authorized access only\n' > /etc/ssh/task1-banner
+grep -nE '^(Include|Match|Port|AllowUsers|PermitRootLogin|MaxAuthTries|Banner)' /etc/openssh/sshd_config
+```
+
+В действующем `/etc/openssh/sshd_config` задать **один** набор директив до первого блока `Match` (старые активные `Port`/`AllowUsers` не оставлять):
+
+```text
+Port 2027
+AllowUsers sshuser
+PermitRootLogin no
+MaxAuthTries 2
+Banner /etc/ssh/task1-banner
+```
+
+```sh
+sshd -t
+sshd -T | grep -Ei '^(port|allowusers|permitrootlogin|maxauthtries|banner) '
+systemctl reload sshd
+ss -ltnp | grep ':2027'
+```
+
+**BIND:** не пересоздавайте `au-team.irpo.zone`: A-записи `hq-rtr`, `br-rtr`, `br-fw`, `hq-srv`, `hq-cli`, `br-srv` уже были. В существующей зоне исправьте только перепутанные записи `docker A 172.16.1.1` и `web A 172.16.2.1`; увеличьте SOA serial. Обратные зоны в прошлой проверке существовали; исправьте их SOA `root.au-team.itpo.` на `root.au-team.irpo.`, проверьте два обязательных PTR для `10.10.100.2` и `10.20.20.2`. Перед правкой:
+
+```sh
+cp -a /etc/bind/local.conf /etc/bind/local.conf.before-task1
+cp -a /etc/bind/options.conf /etc/bind/options.conf.before-task1
+cp -a /etc/bind/zone/au-team.irpo.zone /etc/bind/zone/au-team.irpo.zone.before-task1
+ls -l /etc/bind/zone
+grep -R -n 'docker\|web\|au-team.irpo\|in-addr.arpa\|listen-on\|forwarders' /etc/bind /etc/named.conf
+# Исправить только адреса в двух строках существующей прямой зоны:
+sed -i -E '/^[[:space:]]*docker[[:space:]]/s/172\.16\.2\.1/172.16.1.1/; /^[[:space:]]*web[[:space:]]/s/172\.16\.1\.1/172.16.2.1/' /etc/bind/zone/au-team.irpo.zone
+grep -nE '^[[:space:]]*(docker|web)[[:space:]]' /etc/bind/zone/au-team.irpo.zone
+```
+
+В `/etc/bind/local.conf` добавить объявления существующих файлов зон, если отсутствуют; **имена после `file` взять из фактического `ls`, не из шаблона**. Прямая зона должна указывать на имеющийся `/etc/bind/zone/au-team.irpo.zone`; обратные — на реальные файлы зоны `100.10.10.in-addr.arpa` и `20.20.10.in-addr.arpa`. В существующем блоке `options` файла `/etc/bind/options.conf` дополнить `listen-on` адресом `10.10.100.2`, разрешить запросы из HQ/BR подсетей, задать `forwarders { 77.88.8.7; };`; второй блок `options` не создавать.
+
+```sh
+named-checkconf /etc/named.conf
+named-checkzone au-team.irpo /etc/bind/zone/au-team.irpo.zone
+# Аналогично named-checkzone для двух фактических файлов обратных зон.
+systemctl list-unit-files | grep -E '^(named|bind)'
+# Запустить именно установленный юнит named либо bind:
+systemctl enable --now named
+dig @10.10.100.2 docker.au-team.irpo A +short
+dig @10.10.100.2 web.au-team.irpo A +short
+dig @10.10.100.2 -x 10.10.100.2 +short
+dig @10.10.100.2 -x 10.20.20.2 +short
+```
+
+Если юнит называется `bind`, используйте его вместо `named`. Если `named-checkconf` выдаёт ошибку, сервис не запускать до исправления.
+
+## HQ-CLI — DHCP уже выбран
+
+```sh
+hostnamectl set-hostname hq-cli.au-team.irpo
+timedatectl set-timezone Europe/Moscow
+nmcli -f NAME,DEVICE,TYPE con show
+# Подставьте имя профиля ens3, затем переподнимите его:
+nmcli con up '<ПРОФИЛЬ_ENS3>'
+ip -4 addr show ens3
+ip -4 route
+cat /etc/resolv.conf
+```
+
+Ожидать `.2/28`, gateway `.1`, DNS `10.10.100.2`, суффикс `au-team.irpo`. Во время прошлого аудита HQ-RTR был остановлен, поэтому отсутствие DHCP-аренды **не доказывало ошибку профиля**. Не назначайте статический адрес вместо уже подготовленного DHCP.
+
+## BR-RTR — дополнить существующие `isp` и `fw`
+
+```text
+enable
+configure
+hostname br-rtr
+username net_admin
+ password P@ssw0rd
+ role admin
+ exit
+ip route 0.0.0.0/0 172.16.2.1
+interface tunnel.0
+ ip address 10.10.10.2/30
+ ip mtu 1400
+ ip tunnel 172.16.2.2 172.16.1.2 mode gre
+ ip ospf network point-to-point
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 P@ssw0rd
+ exit
+router ospf 1
+ network 10.10.10.0 0.0.0.3 area 0
+ network 10.20.10.0 0.0.0.3 area 0
+ exit
+interface isp
+ ip nat outside
+ exit
+interface fw
+ ip nat inside
+ exit
+ip nat pool BR-LOCAL 10.20.10.2,10.20.20.1-10.20.20.14,10.20.30.1-10.20.30.6
+ip nat source dynamic inside pool BR-LOCAL overload interface isp
+end
+write memory
+```
+
+Проверить через `show running-config`, нет ли уже отдельных строк из блока. Не повторять IP `isp` и `fw`. FQDN/часовой пояс аналогично HQ-RTR: `ip domain-name au-team.irpo` и `ntp timezone utc+3` только при поддержке данного CLI.
+
+Важная развилка в задании: буквально сказано «OSPF на роутерах только на GRE», но также «BR-FW OSPF на порту к BR-RTR». Для **рабочего** OSPF-соседства BR-RTR↔BR-FW пришлось включить сеть `10.20.10.0/30` на BR-RTR, как показано выше. Если эксперт требует буквально только GRE, соседство с BR-FW невозможно; тогда нужны статические маршруты BR-RTR↔BR-FW и передача BR LAN в OSPF через redistribution. Настройка OSPF только на BR-FW не даст соседства. Это расхождение критериев следует согласовать до экзаменационной сдачи.
+
+## BR-FW — только веб-интерфейс Ideco
+
+Порты и адреса `Leth5/oif0=10.20.10.2/30`, `Leth6/iif0=10.20.20.1/28`, `Leth7/iif1=10.20.30.1/29` уже были. В веб-интерфейсе добавить default gateway `10.20.10.1` через Leth5; включить OSPF area 0 **только** на Leth5 и анонс `10.20.20.0/28`, `10.20.30.0/29` через connected redistribution с фильтром, если он поддерживается в этой версии. Проверить существующие firewall/NAT-политики — они не были доступны при прошлом аудите, поэтому команды их замены без текущего вывода дать нельзя. Для связи HQ↔BR трафик к HQ-сетям не должен NAT-иться на Ideco. Настроить hostname `br-fw.au-team.irpo` и часовой пояс площадки через управление сервером.
+
+## BR-SRV — заполнить пустой адрес и настроить SSH
+
+`ens3` в статическом профиле был без IPv4; `ens4=169.254.2.101/30` не трогать.
+
+```sh
+printf '10.20.20.2/28\n' > /etc/net/ifaces/ens3/ipv4address
+printf 'default via 10.20.20.1\n' > /etc/net/ifaces/ens3/ipv4route
+systemctl restart network
+hostnamectl set-hostname br-srv.au-team.irpo
+timedatectl set-timezone Europe/Moscow
+id sshuser || useradd -u 2027 -m -s /bin/bash sshuser
+passwd sshuser
+printf 'sshuser ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/90-sshuser
+chmod 0440 /etc/sudoers.d/90-sshuser
+visudo -c
+printf 'Authorized access only\n' > /etc/ssh/task1-banner
+```
+
+Для `passwd` задать `P@ssw0rd`. В `/etc/openssh/sshd_config` вне `Match` установить те же пять строк, что на HQ-SRV: `Port 2027`, `AllowUsers sshuser`, `PermitRootLogin no`, `MaxAuthTries 2`, `Banner /etc/ssh/task1-banner`; затем `sshd -t`, `sshd -T`, `systemctl reload sshd`. Через действующий сетевой профиль указать DNS `10.10.100.2`, суффикс `au-team.irpo`; проверить `/etc/resolv.conf`. Сначала убедиться, что новый SSH/2027 работает; старый служебный доступ по SSH/22 после изменения исчезнет.
+
+
+
+## Контроль после дополнений
+
+- EcoRouter: `show running-config`, `show interface tunnel.0`, `show ip route`, OSPF neighbors, NAT counters. HQ и BR должны видеть удалённые LAN через GRE `10.10.10.1↔10.10.10.2`.
+- ISP: `ip -4 addr`, `ip -4 route`, `iptables -t nat -L POSTROUTING -n -v`; у маршрутизаторов должен появиться выход наружу.
+- HQ-CLI: DHCP `.2/28`, DNS `10.10.100.2`. BR-CLI: адрес `.2/29`, DNS через HQ-SRV.
+- DNS: A `docker→172.16.1.1`, `web→172.16.2.1`, PTR двух серверов, внешний запрос через forwarder.
+- SSH: вход как `sshuser` на TCP/2027, UID 2027, `sudo -n true` от этого пользователя; запрет других пользователей.
+
+Источники синтаксиса: [EcoRouter GRE](https://docs.ecorouter.ru/%D0%A0%D1%83%D0%BA%D0%BE%D0%B2%D0%BE%D0%B4%D1%81%D1%82%D0%B2%D0%BE/23-%D0%9D%D0%B0%D1%81%D1%82%D1%80%D0%BE%D0%B9%D0%BA%D0%B0-%D1%82%D1%83%D0%BD%D0%BD%D0%B5%D0%BB%D0%B8%D1%80%D0%BE%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F/01-GRE), [EcoRouter NAT](https://docs.ecorouter.ru/%D0%A0%D1%83%D0%BA%D0%BE%D0%B2%D0%BE%D0%B4%D1%81%D1%82%D0%B2%D0%BE/25-%D0%92%D1%81%D1%82%D1%80%D0%BE%D0%B5%D0%BD%D0%BD%D1%8B%D0%B9-NAT/), [EcoRouter DHCP](https://docs.ecorouter.ru/%D0%A0%D1%83%D0%BA%D0%BE%D0%B2%D0%BE%D0%B4%D1%81%D1%82%D0%B2%D0%BE/11-DHCP/03-%D0%9D%D0%B0%D1%81%D1%82%D1%80%D0%BE%D0%B9%D0%BA%D0%B0-DHCP-%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80%D0%B0), [EcoRouter OSPF/MD5](https://rdp.ru/wp-content/uploads/ER_UserGuide_EN.pdf), [Ideco OSPF v21](https://docs.ideco.ru/pdf/v21/ru-ngfw-settings-routing-ospf.pdf).
